@@ -1,7 +1,8 @@
 from builtins import object
 from fuzzywuzzy import fuzz
 from os import environ
-import threading, random
+import threading
+import random
 
 from gmusicapi import CallFailure, Mobileclient
 
@@ -39,6 +40,25 @@ class GMusicWrapper(object):
 
         return [x[query_type] for x in results[hits_key]]
 
+    def _search_library_for_first(self, query_type, query):
+        #try searching the library instead of the api
+        for trackid, trackdata in self.library.items():
+            if query_type in trackdata:
+                if query.lower() in trackdata[query_type].lower():
+                    return trackdata
+        return None
+
+    def _search_library(self, query_type, query):
+        #try searching the library instead of the api
+        found = []
+        for trackid, trackdata in self.library.items():
+            if query_type in trackdata:
+                if query.lower() in trackdata[query_type].lower():
+                    found.append(trackdata)
+        if not found:
+            return None
+        return found
+
     def is_indexing(self):
         return self.indexing_thread.is_alive()
 
@@ -63,6 +83,10 @@ class GMusicWrapper(object):
         search = self._search("artist", name)
 
         if len(search) == 0:
+            searchLib = self._search_library("artist", name)
+            if searchLib is not None:
+                self.logger.debug(searchLib)
+                return searchLib
             return False
 
         return self._api.get_artist_info(search[0]['artistId'],
@@ -75,6 +99,9 @@ class GMusicWrapper(object):
         search = self._search("album", name)
 
         if len(search) == 0:
+            searchLib = self._search_library("album", name)
+            if searchLib is not None:
+                return searchLib
             return False
 
         return self._api.get_album_info(search[0]['albumId'])
@@ -117,10 +144,14 @@ class GMusicWrapper(object):
     def get_song(self, name, artist_name=None):
         if artist_name:
             name = "%s %s" % (artist_name, name)
-
+        self.logger.debug("get_song() : name: %s" % (name))
         search = self._search("song", name)
+        self.logger.debug("result length: %d" % len(search))
 
         if len(search) == 0:
+            searchLib = self._search_library_for_first("title", name)
+            if searchLib is not None:
+                return searchLib
             return False
 
         return search[0]
@@ -139,7 +170,29 @@ class GMusicWrapper(object):
         return "%s/alexa/stream/%s" % (environ['APP_URL'], song_id)
 
     def get_thumbnail(self, artist_art):
-        return artist_art.replace("http://", "https://")
+        artistArtKey = 'artistArtRef'
+        albumArtKey = 'albumArtRef'
+        if artistArtKey in artist_art:
+            artist_art = artist_art[artistArtKey] 
+        elif albumArtKey in artist_art:
+            artist_art = artist_art[albumArtKey] 
+        else:
+            return self.default_thumbnail()               
+
+        if type(artist_art) is list:
+            if type(artist_art[0]) is dict:
+                artUrl = artist_art[0]['url']
+        elif type(artist_art) is dict:
+            artUrl = artist_art['url']
+        else:
+            artUrl = artist_art
+        return self.urlReplaceWithSecureHttps(artUrl)
+
+    def urlReplaceWithSecureHttps(self, url):
+        return url.replace("http://", "https://")
+
+    def default_thumbnail(self):
+        return 'https://lh3.googleusercontent.com/gdBHEk-u3YRDtuCU3iDTQ52nZd1t4GPmldYaT26Jh6EhXgp1mlhQiuLFl4eXDAXzDig5'
 
     def get_all_user_playlist_contents(self):
         return self._api.get_all_user_playlist_contents()
@@ -155,7 +208,11 @@ class GMusicWrapper(object):
         # key
         if 'track' in track:
             track = track['track']
-
+        
+        if self.use_library_first():
+        #Using free version track id first
+            if 'id' in track:
+                return (track, track['id'])
         if 'storeId' in track:
             return (track, track['storeId'])
         elif 'trackId' in track:
@@ -208,13 +265,21 @@ class GMusicWrapper(object):
 
         return speech_text
 
-    def closest_match(self, request_name, all_matches, minimum_score=70):
+    def closest_match(self, request_name, all_matches, artist_name='', minimum_score=70):
         # Give each match a score based on its similarity to the requested
         # name
-        request_name = request_name.lower().replace(" ", "")
+        self.logger.debug("The artist name is " + str(artist_name))
+        request_name = request_name.lower() + artist_name.lower()
         scored_matches = []
         for i, match in enumerate(all_matches):
-            name = match['name'].lower().replace(" ", "")
+            try:
+                name = match['name'].lower()
+            except (KeyError, TypeError):
+                i = match
+                name = all_matches[match]['title'].lower()
+                if artist_name != "":
+                    name += all_matches[match]['artist'].lower()
+
             scored_matches.append({
                 'index': i,
                 'name': name,
@@ -223,6 +288,7 @@ class GMusicWrapper(object):
 
         sorted_matches = sorted(scored_matches, key=lambda a: a['score'], reverse=True)
         top_scoring = sorted_matches[0]
+        self.logger.debug("The top scoring match was: " + str(top_scoring))
         best_match = all_matches[top_scoring['index']]
 
         # Make sure we have a decent match (the score is n where 0 <= n <= 100)
@@ -240,6 +306,8 @@ class GMusicWrapper(object):
     def get_song_data(self, song_id):
         return self._api.get_track_info(song_id)
 
+    def use_library_first(self):
+        return environ['USE_LIBRARY_FIRST'].lower() == 'true'
 
     @classmethod
     def generate_api(cls, **kwargs):
